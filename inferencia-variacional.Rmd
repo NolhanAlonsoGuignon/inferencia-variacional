@@ -1,0 +1,908 @@
+---
+title: "Inferencia Variacional"
+subtitle: "Fundamentos, CAVI, SVI y BBVI, con una aplicación a modelado de tópicos mediante LDA"
+author:
+  - Nolhan Denis Alonso Guignon
+  - Ismael Amador García
+date: "2026"
+abstract: |
+  La inferencia variacional (VI) reformula el cálculo de la distribución a posteriori como un problema de optimización: en lugar de muestrear de $p(z \mid x)$, se busca la distribución más próxima a ella dentro de una familia tratable. Este documento desarrolla el marco teórico completo —divergencia de Kullback-Leibler, ELBO, familia de campo medio y el algoritmo CAVI—, su especialización a modelos conjugados de la familia exponencial y las dos extensiones que la han hecho práctica a gran escala: la inferencia variacional estocástica (SVI) y la inferencia variacional de caja negra (BBVI). Como aplicación, se ajusta un modelo *Latent Dirichlet Allocation* por EM variacional sobre un corpus de 1 800 fragmentos de obras clásicas, se selecciona el número de tópicos mediante perplejidad fuera de muestra y se evalúa la coherencia de los tópicos descubiertos frente a las categorías reales de los textos.
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: pdflatex
+geometry: margin=2.5cm
+fontsize: 11pt
+linkcolor: blue
+urlcolor: blue
+header-includes:
+  - \usepackage[spanish,es-noshorthands,es-tabla]{babel}
+  - \usepackage{graphicx}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage[ruled,vlined,spanish,onelanguage]{algorithm2e}
+  - \SetKwInput{KwIn}{Entrada}
+  - \SetKwInput{KwOut}{Salida}
+  - \SetKw{KwInit}{Inicializar:}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.pos    = "H",
+  out.width  = "85%",
+  fig.width  = 8,
+  fig.height = 5
+)
+dir.create("figures", showWarnings = FALSE)
+```
+
+\newpage
+
+# Introducción
+
+Esta sección presenta la motivación de la inferencia variacional y su lugar dentro de la inferencia bayesiana.
+
+## El problema de la inferencia en modelos probabilísticos
+
+En la estadística moderna, y en particular en el enfoque bayesiano, uno de los problemas centrales es la construcción de modelos probabilísticos para datos observados que se suponen generados a partir de variables latentes desconocidas. Hacer inferencia sobre esas variables consiste en calcular su distribución a posteriori, es decir, su distribución condicionada a los datos observados (la evidencia).
+
+Sin embargo, en la mayoría de modelos de interés práctico la distribución a posteriori no tiene forma analítica cerrada. El motivo es que la distribución marginal de los datos $p(x)$, que aparece en el denominador de
+
+$$p(z \mid x) = \frac{p(x, z)}{p(x)},$$
+
+es en general intratable. El problema se agrava cuando las variables latentes son interdependientes o se organizan en estructuras jerárquicas complejas. Formalmente, el obstáculo es la constante de normalización de la posterior, que exige integrar la distribución conjunta sobre todas las configuraciones posibles de las variables latentes.
+
+En consecuencia, la inferencia exacta deja de ser viable en muchos casos y se recurre a métodos aproximados: bien métodos de optimización como la inferencia variacional, bien métodos de muestreo con garantías asintóticas como MCMC.
+
+## Métodos aproximados: MCMC frente a inferencia variacional
+
+Aunque ambos métodos persiguen el mismo objetivo, sus enfoques son completamente distintos. Los métodos MCMC se apoyan en la teoría de cadenas de Markov para garantizar convergencia asintótica: a cambio de un coste computacional elevado, producen muestras de la distribución a posteriori exacta. Ese coste puede llegar a ser prohibitivo, y además las muestras obtenidas presentan dependencia secuencial por construcción, lo que reduce el tamaño muestral efectivo.
+
+La inferencia variacional adopta otra perspectiva. En lugar de muestrear de la posterior, reformula el problema como una tarea de optimización: se busca, dentro de una familia restringida de distribuciones, aquella que mejor aproxima la posterior verdadera según una medida de discrepancia, típicamente la divergencia de Kullback-Leibler.
+
+Este cambio transforma un problema de integración difícil en un problema de optimización, lo que permite aprovechar herramientas eficientes de optimización numérica y escalar a grandes conjuntos de datos. Los métodos variacionales suelen ser considerablemente más rápidos que MCMC y más adecuados para datos masivos o aplicaciones en tiempo real.
+
+Esta eficiencia tiene un precio en precisión. A diferencia de MCMC, los métodos variacionales no convergen a la distribución exacta, sino a la mejor aproximación dentro de la familia elegida. Esto puede introducir sesgos sistemáticos, especialmente en la estimación de la varianza y en la captura de dependencias entre variables.
+
+En resumen, la elección entre MCMC e inferencia variacional no es trivial y responde a un compromiso entre precisión y coste computacional.
+
+# Fundamentos de la inferencia variacional
+
+La inferencia variacional parte de una idea sencilla pero potente: en lugar de calcular exactamente la distribución a posteriori, algo que en la práctica suele ser inabordable, se reformula el problema como uno de optimización. El objetivo deja de ser *resolver* la posterior y pasa a ser encontrar la mejor aproximación posible dentro de una familia de distribuciones manejable.
+
+Se introduce una clase de distribuciones candidatas (campo medio, familia exponencial, ...) y se busca la más próxima a la posterior real según algún criterio de discrepancia. Este cambio de perspectiva es lo que permite construir algoritmos escalables y aplicables a modelos complejos.
+
+## Formulación del problema
+
+Consideremos un modelo probabilístico con variables observadas $x$ y variables latentes $z$, descrito mediante la distribución conjunta $p(x, z)$. El objetivo de la inferencia bayesiana es caracterizar la distribución a posteriori
+
+$$p(z \mid x) = \frac{p(x, z)}{p(x)}.$$
+
+La dificultad está en el denominador, pues la evidencia o verosimilitud marginal de los datos es
+
+$$p(x) = \int p(x, z)\, dz.$$
+
+En la mayoría de modelos de interés esta integral no admite solución analítica ni puede calcularse eficientemente, en especial cuando $z$ es de alta dimensión o incluye estructuras complejas (asignaciones discretas, jerarquías o dependencias no lineales).
+
+El problema de inferencia se reduce entonces a aproximar $p(z \mid x)$ sin necesidad de calcular $p(x)$. Este es el punto de partida de la inferencia variacional.
+
+## Aproximación variacional
+
+La idea central consiste en introducir una familia de distribuciones sobre las variables latentes, $q(z) \in \mathcal{Q}$, y buscar dentro de ella la que mejor aproxima la posterior. En general, la posterior exacta no pertenece a $\mathcal{Q}$:
+
+$$q^*(z) = \arg\min_{q(z) \in \mathcal{Q}} \mathrm{dist}\big(q(z), p(z \mid x)\big).$$
+
+La elección de la discrepancia es clave y no es trivial, ya que debe comportarse adecuadamente en un espacio de funciones de dimensión alta. El estándar en inferencia variacional es la divergencia de Kullback-Leibler:
+
+$$q^*(z) = \arg\min_{q(z) \in \mathcal{Q}} \mathrm{KL}\big(q(z) \,\|\, p(z \mid x)\big).$$
+
+Este planteamiento tiene una consecuencia importante: la calidad de la aproximación depende directamente de la riqueza de la familia $\mathcal{Q}$. Si es demasiado restrictiva, la aproximación será pobre; si es demasiado flexible, el problema de optimización puede volverse intratable.
+
+## Divergencia de Kullback-Leibler
+
+La divergencia de Kullback-Leibler es una medida de discrepancia entre distribuciones definida como
+
+$$\mathrm{KL}\big(q(z) \,\|\, p(z \mid x)\big) = \int q(z) \log \frac{q(z)}{p(z \mid x)}\, dz.$$
+
+Es siempre no negativa y se anula únicamente cuando ambas distribuciones coinciden. Sin embargo, no es simétrica y, por tanto, no es una distancia en sentido estricto:
+
+$$\mathrm{KL}(q \,\|\, p) \neq \mathrm{KL}(p \,\|\, q).$$
+
+Esta asimetría tiene implicaciones importantes. Al minimizar $\mathrm{KL}(q \,\|\, p)$, el integrando penaliza fuertemente que $q$ asigne masa a regiones donde $p$ es casi nula, pero apenas penaliza que $q$ deje sin cubrir regiones donde $p$ tiene masa. El resultado son aproximaciones concentradas (*mode-seeking*) que tienden a **subestimar la incertidumbre** de la posterior.
+
+La Figura \ref{fig:varianza} lo ilustra con una posterior gaussiana bidimensional con correlación $0.9$. Para este caso el óptimo de campo medio se conoce en forma cerrada: $q_j(z_j) = \mathcal{N}(\mu_j, 1/\Lambda_{jj})$, con $\Lambda = \Sigma^{-1}$ la matriz de precisión. La aproximación acierta en la media, pero su varianza marginal ($0.19$) es mucho menor que la real ($1$).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.55\textwidth]{figures/subestimacion-varianza.png}
+\caption{Aproximación de campo medio de una posterior gaussiana correlada. La aproximación que minimiza $\mathrm{KL}(q \,\|\, p)$ se concentra en la zona de alta densidad y subestima la varianza marginal.}
+\label{fig:varianza}
+\end{figure}
+
+Además de la KL se han propuesto otras medidas de discrepancia, aunque su uso práctico está limitado por el compromiso entre expresividad y tratabilidad. Las $f$-divergencias generalizan la KL y permiten modular el comportamiento de la aproximación entre *mode-seeking* (que tiende a subestimar la varianza) y *mode-covering* (que tiende a cubrir toda la masa de la posterior), pero en general pierden la estructura del ELBO y complican la optimización estocástica, por lo que su uso se limita a variantes como $\alpha$-VI o Rényi VI (Li y Turner, 2016). Por su parte, la distancia de Wasserstein se emplea en propuestas como los *Wasserstein Autoencoders* para mejorar la geometría del espacio latente, aunque su cálculo es más costoso y no produce directamente cotas del tipo ELBO, lo que dificulta su integración en la VI clásica (Arjovsky et al., 2017; Tolstikhin et al., 2018).
+
+## Evidence Lower Bound (ELBO)
+
+El principal problema de la formulación anterior es que la divergencia KL depende de la posterior $p(z \mid x)$, precisamente la cantidad que no podemos calcular. Para sortearlo se reescribe la expresión aislando el término intratable.
+
+Partiendo de la definición de la posterior,
+
+$$\log p(x) = \log p(x, z) - \log p(z \mid x),$$
+
+sumamos y restamos $\log q(z)$:
+
+$$\log p(x) = \big(\log q(z) - \log p(z \mid x)\big) + \big(\log p(x, z) - \log q(z)\big).$$
+
+Tomando esperanzas respecto a $q(z)$ (el lado izquierdo no depende de $z$) se obtiene
+
+$$\log p(x) = \mathrm{KL}\big(q(z) \,\|\, p(z \mid x)\big) + \mathcal{L}(q),$$
+
+donde
+
+$$\mathcal{L}(q) = \mathbb{E}_{q}\big[\log p(x, z)\big] - \mathbb{E}_{q}\big[\log q(z)\big].$$
+
+Esta cantidad se denomina *Evidence Lower Bound* (ELBO): como la KL es no negativa, $\mathcal{L}(q) \le \log p(x)$ para cualquier $q$. Dado que $\log p(x)$ no depende de $q$, **minimizar la divergencia KL equivale a maximizar el ELBO**, y el ELBO sí es calculable porque solo involucra la conjunta $p(x, z)$ (Figura \ref{fig:elbo}).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.7\textwidth]{figures/descomposicion-elbo.png}
+\caption{La log-evidencia es constante respecto a $q$; al maximizar el ELBO, el hueco entre ambas cantidades, que es exactamente $\mathrm{KL}(q \,\|\, p)$, se reduce.}
+\label{fig:elbo}
+\end{figure}
+
+El ELBO expresa un equilibrio entre dos términos:
+
+- **Ajuste a los datos**, $\mathbb{E}_q\big[\log p(x, z)\big]$: favorece que $q$ concentre su masa en los valores de $z$ que hacen alta la conjunta $p(x, z)$. Este término, llevado al extremo, empujaría a $q$ a colapsar sobre el máximo a posteriori, y es el origen de la subestimación de la varianza vista en la Figura \ref{fig:varianza}.
+
+- **Entropía de $q$**, $-\mathbb{E}_{q}\big[\log q(z)\big]$: premia las distribuciones dispersas e impide que $q$ degenere en una masa puntual. Actúa como regularizador, compensando la tendencia del término anterior a sobreajustarse.
+
+## Familia de campo medio
+
+Para poder optimizar el ELBO es necesario restringir la familia variacional $\mathcal{Q}$. La elección más sencilla y extendida es la familia de campo medio (*mean-field*), que asume independencia entre las variables latentes:
+
+$$q(z) = \prod_{j=1}^{m} q_j(z_j).$$
+
+Esta hipótesis simplifica enormemente el problema al eliminar las dependencias entre variables en la aproximación, pero introduce una limitación estructural: la aproximación no puede capturar correlaciones de la posterior.
+
+En la práctica, esto se traduce en aproximaciones razonables en media, pero que tienden a subestimar la varianza y a suavizar las estructuras de dependencia. Alternativas como la inferencia variacional estructurada permiten conservar parte de esas dependencias a cambio de un mayor coste computacional.
+
+## Coordinate Ascent Variational Inference (CAVI)
+
+Fijada la familia de campo medio, el ELBO puede maximizarse respecto a cada factor $q_j(z_j)$ manteniendo fijos los demás. Esta es la idea del algoritmo *Coordinate Ascent Variational Inference* (CAVI), que se apoya directamente en la factorización de campo medio.
+
+El resultado fundamental es que el factor óptimo, con el resto fijo, tiene la forma
+
+$$q_j^*(z_j) \propto \exp \Big\{ \mathbb{E}_{-j}\big[\log p(z_j \mid z_{-j}, x)\big] \Big\},$$
+
+donde la esperanza se toma respecto a la distribución variacional del resto de variables, $\prod_{l \neq j} q_l(z_l)$. El procedimiento completo se resume en el Algoritmo \ref{alg:cavi}.
+
+\begin{algorithm}[H]
+\caption{Coordinate Ascent Variational Inference (CAVI)}
+\label{alg:cavi}
+\KwIn{Un modelo $p(x, z)$ y un conjunto de datos $x$}
+\KwOut{Una densidad variacional $q(z) = \prod_{j=1}^m q_j(z_j)$}
+\KwInit{factores variacionales $q_j(z_j)$}\;
+\While{el ELBO no haya convergido}{
+    \For{$j \in \{1, \ldots, m\}$}{
+        $q_j(z_j) \leftarrow \exp \{ \mathbb{E}_{-j}[\log p(z_j \mid z_{-j}, x)] \}$ (normalizada)\;
+    }
+    Calcular $\mathrm{ELBO}(q) = \mathbb{E}_q[\log p(x, z)] - \mathbb{E}_q[\log q(z)]$\;
+}
+\Return{$q(z)$}
+\end{algorithm}
+
+Cada actualización no disminuye el ELBO, por lo que el algoritmo converge de forma monótona, aunque solo está garantizada la convergencia a un óptimo local. En la práctica conviene lanzarlo desde varias inicializaciones.
+
+# Inferencia variacional en la familia exponencial
+
+Esta sección presenta una familia de modelos con propiedades especialmente favorables para la inferencia variacional. A continuación se describe la estructura local-global, típica de los problemas modernos, y se deriva la forma concreta que adopta CAVI en este contexto.
+
+## Familia exponencial
+
+Una distribución pertenece a la familia exponencial si puede escribirse como
+
+$$p(x \mid \eta) = h(x) \exp\big\{\eta^{\intercal} T(x) - A(\eta)\big\},$$
+
+donde:
+
+- $\eta$ es el vector de parámetros naturales;
+- $T(x)$ es el estadístico suficiente;
+- $A(\eta)$ es la función de log-partición, que garantiza la normalización;
+- $h(x)$ es la medida base, que no depende de $\eta$.
+
+Esta estructura es muy conveniente en inferencia variacional porque las esperanzas de los estadísticos suficientes se obtienen analíticamente como derivadas de la log-partición, $\mathbb{E}[T(x)] = \nabla_\eta A(\eta)$. A ella pertenecen distribuciones como la normal, Bernoulli, multinomial, Dirichlet o gamma.
+
+Consideremos un modelo con la estructura
+
+$$p(x, z, \beta) = p(\beta) \prod_{n=1}^N p(x_n, z_n \mid \beta).$$
+
+Si cada distribución condicional completa pertenece a la familia exponencial y el prior $p(\beta)$ es conjugado, las condicionales completas son a su vez de la familia exponencial y las actualizaciones de CAVI tienen forma cerrada. En particular, si $q(\beta)$ pertenece a la misma familia que el prior, su parámetro natural óptimo es (Hoffman et al., 2013)
+
+$$\lambda = \alpha + \sum_{n=1}^N \mathbb{E}_{q(z_n)}\big[T(x_n, z_n)\big],$$
+
+donde $\alpha$ es el parámetro natural del prior. Es decir, en modelos conjugados de la familia exponencial la actualización global se reduce a sumar estadísticos suficientes esperados, lo que la hace muy eficiente.
+
+## Estructura local frente a global
+
+Una de las propiedades más importantes de los modelos en los que la inferencia variacional resulta eficiente es la existencia de una estructura jerárquica que distingue entre variables globales y locales. Esta distinción tiene implicaciones tanto en la formulación del modelo como en el diseño de los algoritmos.
+
+Consideremos datos observados $x = (x_1, \ldots, x_N)$, variables latentes locales $z = (z_1, \ldots, z_N)$ y variables latentes globales $\beta$, con la factorización ya vista:
+
+$$p(x, z, \beta) = p(\beta) \prod_{n=1}^N p(x_n, z_n \mid \beta).$$
+
+Las variables globales $\beta$ capturan propiedades compartidas por todos los datos, mientras que cada variable local $z_n$ describe la estructura específica de la observación $x_n$. Esta factorización implica una propiedad clave de independencia condicional:
+
+$$p(x_n, z_n \mid x_{-n}, z_{-n}, \beta) = p(x_n, z_n \mid \beta),$$
+
+es decir, dado $\beta$, cada par $(x_n, z_n)$ es independiente del resto. Esta propiedad es la base de muchos algoritmos escalables.
+
+En inferencia variacional, la estructura se traslada a la familia variacional. Bajo campo medio:
+
+$$q(\beta, z) = q(\beta) \prod_{n=1}^N q(z_n),$$
+
+lo que separa la optimización en dos niveles: uno global, para $q(\beta)$, y otro local, para cada $q(z_n)$.
+
+Un ejemplo paradigmático es el modelo bayesiano de mezcla de gaussianas. Cada observación $x_n$ procede de uno de varios componentes gaussianos no observados:
+
+- $z_n$ indica a qué componente pertenece $x_n$ (variable local);
+- $\beta$ agrupa las medias, varianzas y proporciones de los componentes (variables globales).
+
+Dado $\beta$, cada $z_n$ puede inferirse de forma independiente usando solo $x_n$. En cambio, la estimación de $\beta$ depende de todos los datos a través de las asignaciones $z_n$.
+
+Este patrón aparece en muchos modelos modernos, como *Latent Dirichlet Allocation* (LDA), que se estudia en la Sección \ref{sec:lda}:
+
+- las variables globales son los tópicos, distribuciones sobre el vocabulario compartidas por todo el corpus;
+- las variables locales son las proporciones de tópicos de cada documento y la asignación de cada palabra a un tópico.
+
+En resumen, la distinción entre variables locales y globales permite descomponer la inferencia en subproblemas locales independientes, que pueden paralelizarse y combinarse con optimización estocástica. Esta es la clave del escalado a conjuntos de datos masivos.
+
+## Derivación de las actualizaciones variacionales
+
+Establecidos el modelo y la familia variacional, el objetivo es encontrar la distribución $q(z, \beta)$ que maximiza
+
+$$\mathcal{L}(q) = \mathbb{E}_{q}\big[\log p(x, z, \beta)\big] - \mathbb{E}_{q}\big[\log q(z, \beta)\big].$$
+
+Bajo campo medio, el óptimo de cada factor con los demás fijos es
+
+$$q_j^*(z_j) \propto \exp \Big\{ \mathbb{E}_{-j}\big[\log p(x, z, \beta)\big] \Big\},$$
+
+expresión equivalente a la de la sección de CAVI, ya que $p(z_j \mid z_{-j}, x)$ y $p(x, z, \beta)$ difieren en factores que no dependen de $z_j$. Aplicando este resultado a la estructura local-global se obtienen dos tipos de actualización.
+
+**Actualizaciones locales.** Para cada variable local $z_n$:
+
+$$q(z_n) \propto \exp \Big\{ \mathbb{E}_{q(\beta)}\big[\log p(x_n, z_n \mid \beta)\big] \Big\}.$$
+
+Cada variable local se actualiza usando solo su dato $x_n$ y la información global contenida en $q(\beta)$. Gracias a la independencia condicional, estas actualizaciones pueden realizarse en paralelo para todo $n$.
+
+**Actualizaciones globales.** Para las variables globales:
+
+$$q(\beta) \propto \exp \Big\{ \mathbb{E}_{q(z)}\Big[\log p(\beta) + \sum_{n=1}^N \log p(x_n, z_n \mid \beta)\Big] \Big\}.$$
+
+La actualización depende de todos los datos, pero solo a través de las distribuciones variacionales locales: $q(\beta)$ se construye a partir de estadísticos agregados del conjunto de datos. En modelos conjugados de la familia exponencial esto se reduce a la expresión ya vista,
+
+$$\text{parámetro actualizado} = \text{parámetro del prior} + \sum_{n=1}^N \mathbb{E}\big[T(x_n, z_n)\big].$$
+
+Algorítmicamente, estas ecuaciones dan lugar a un esquema iterativo que alterna dos pasos:
+
+1. actualizar todas las distribuciones locales $q(z_n)$ con el valor actual de $q(\beta)$;
+2. actualizar la distribución global $q(\beta)$ con los estadísticos agregados de las locales.
+
+Este esquema es exactamente CAVI, y cada paso garantiza que el ELBO no disminuye.
+
+Sin embargo, presenta una limitación importante: cada actualización global requiere recorrer el conjunto de datos completo, lo que resulta prohibitivo a gran escala. Esta observación motiva la inferencia variacional estocástica, que aprovecha la estructura local-global para sustituir las sumas sobre todos los datos por estimaciones basadas en submuestras.
+
+# Stochastic Variational Inference (SVI)
+
+Esta sección presenta la principal solución al problema del escalado de la inferencia variacional: la optimización estocástica, una técnica ya omnipresente en aprendizaje automático.
+
+## Limitaciones de la inferencia variacional clásica
+
+CAVI es muy eficiente en modelos conjugados de la familia exponencial, pero no escala bien con el tamaño de los datos. El problema está en la actualización global:
+
+$$q(\beta) \propto \exp \Big\{ \mathbb{E}_{q(z)}\Big[\log p(\beta) + \sum_{n=1}^N \log p(x_n, z_n \mid \beta)\Big] \Big\}.$$
+
+La suma sobre todas las observaciones implica que:
+
+- cada iteración requiere recorrer el conjunto de datos completo;
+- el coste por iteración es $O(N)$;
+- el método no es viable con millones de observaciones.
+
+Además, al inicio del algoritmo las actualizaciones locales se calculan con una estimación global todavía pobre, por lo que buena parte de ese cómputo se desperdicia. En definitiva, CAVI es eficiente por iteración, pero no escalable.
+
+## Optimización estocástica
+
+La propuesta de *Stochastic Variational Inference* (Hoffman et al., 2013) consiste en optimizar el ELBO mediante optimización estocástica, al estilo del descenso de gradiente estocástico (SGD): en cada iteración se utiliza un subconjunto de los datos (*mini-batch*) para construir un estimador insesgado del gradiente.
+
+Sea $\lambda$ el parámetro de $q(\beta)$. Tras optimizar las variables locales, el ELBO se descompone como un término global más una suma sobre las observaciones:
+
+$$\mathcal{L}(\lambda) = \mathbb{E}_{q}\big[\log p(\beta) - \log q(\beta)\big] + \sum_{n=1}^N \mathcal{L}_n(\lambda), \qquad \mathcal{L}_n(\lambda) = \mathbb{E}_{q}\big[\log p(x_n, z_n \mid \beta) - \log q(z_n)\big].$$
+
+Si se elige un índice $i$ uniformemente al azar, el estimador
+
+$$\hat{\nabla}_{\lambda} \mathcal{L} = \nabla_\lambda \mathbb{E}_{q}\big[\log p(\beta) - \log q(\beta)\big] + N \, \nabla_{\lambda} \mathcal{L}_i$$
+
+es insesgado, ya que
+
+$$\mathbb{E}_i \big[ N \, \nabla_{\lambda} \mathcal{L}_i \big] = N \sum_{i=1}^N \frac{1}{N} \nabla_{\lambda} \mathcal{L}_i = \sum_{i=1}^N \nabla_{\lambda} \mathcal{L}_i.$$
+
+Con un *mini-batch* de tamaño $B$, el factor $N$ se sustituye por $N/B$ y la suma se extiende al lote, lo que reduce la varianza del estimador.
+
+## Gradiente natural
+
+Un elemento clave para obtener algoritmos estables es el uso del gradiente natural en lugar del gradiente euclídeo. La idea procede de la geometría de la información (Amari, 1998) y encaja de forma especialmente natural con la familia exponencial.
+
+El espacio de distribuciones de probabilidad no es euclídeo: al optimizar respecto a $\lambda$ nos movemos en una variedad cuya métrica natural viene dada por la matriz de información de Fisher. El gradiente clásico ignora esta geometría, lo que puede producir trayectorias ineficientes o mal condicionadas: un mismo desplazamiento en $\lambda$ puede suponer un cambio mínimo o enorme en la distribución.
+
+El gradiente natural corrige este problema premultiplicando por la inversa de la matriz de Fisher:
+
+$$\tilde{\nabla}_\lambda \mathcal{L} = F(\lambda)^{-1} \nabla_\lambda \mathcal{L},$$
+
+donde $F(\lambda)$ es la matriz de información de Fisher de $q(\beta \mid \lambda)$.
+
+En modelos conjugados de la familia exponencial se produce una simplificación fundamental: si $\lambda$ es el parámetro natural de $q(\beta)$, entonces $F(\lambda) = \nabla^2_\lambda A(\lambda)$ y el gradiente natural del ELBO toma la forma (Hoffman et al., 2013)
+
+$$\tilde{\nabla}_\lambda \mathcal{L} = \alpha + \sum_{n=1}^N \mathbb{E}_{q(z_n)}\big[T(x_n, z_n)\big] - \lambda.$$
+
+La interpretación es directa: el gradiente natural apunta desde el valor actual $\lambda$ hacia la actualización de CAVI. En otras palabras, un paso de gradiente natural de longitud 1 coincide con la actualización de coordenadas. Esta propiedad evita calcular e invertir explícitamente la matriz de Fisher y conduce a actualizaciones simples y numéricamente estables.
+
+## Algoritmo SVI
+
+SVI combina tres ideas: la descomposición local-global del modelo, los estimadores estocásticos del gradiente y el gradiente natural. En cada iteración $t$:
+
+1. Se selecciona una observación $x_i$ (o un *mini-batch*) uniformemente al azar.
+2. Se optimiza su distribución variacional local, con la misma forma que en la VI clásica:
+$$q(z_i) \propto \exp\Big\{ \mathbb{E}_{q(\beta)}\big[\log p(x_i, z_i \mid \beta)\big] \Big\}.$$
+3. Se calculan los estadísticos suficientes esperados y se reescalan como si la observación se repitiera $N$ veces:
+$$\hat{T} = N \, \mathbb{E}_{q(z_i)}\big[T(x_i, z_i)\big].$$
+4. Se actualizan los parámetros globales con un paso de gradiente natural estocástico, que equivale a una combinación convexa entre el valor anterior y la estimación intermedia (Hoffman et al., 2013):
+$$\lambda^{(t)} = (1 - \rho_t)\,\lambda^{(t-1)} + \rho_t \big(\alpha + \hat{T}\big).$$
+
+El tamaño de paso $\rho_t$ controla el peso de la nueva información. Para garantizar la convergencia debe satisfacer las condiciones de Robbins-Monro (1951), $\sum_t \rho_t = \infty$ y $\sum_t \rho_t^2 < \infty$. Una elección habitual es
+
+$$\rho_t = (t + \tau)^{-\kappa}, \qquad \kappa \in (0.5, 1], \quad \tau \ge 0,$$
+
+donde $\tau$ atenúa las primeras iteraciones y $\kappa$ controla la velocidad a la que se olvida la información antigua.
+
+La ventaja principal de este esquema es que **el coste por iteración no depende de $N$**, lo que permite aplicar inferencia variacional a problemas de gran escala o incluso a flujos continuos de datos.
+
+## Ventajas y aplicaciones
+
+SVI mejora sustancialmente la inferencia variacional clásica cuando se trabaja con grandes volúmenes de datos. Utilizar una pequeña muestra en cada iteración sin introducir sesgo en el gradiente se traduce en un coste por iteración mucho menor, en la posibilidad de actualizar el modelo a medida que llegan datos nuevos y en tiempos de ejecución muy inferiores.
+
+Su principal inconveniente es precisamente la variabilidad de las actualizaciones, que puede hacer inestable la convergencia si la secuencia de tamaños de paso no se ajusta bien. Además, SVI hereda el sesgo propio de la inferencia variacional basada en $\mathrm{KL}(q \,\|\, p)$.
+
+En cuanto a aplicaciones, SVI ha sido fundamental en modelos a gran escala. El ejemplo clásico es LDA, donde permite analizar colecciones de millones de documentos que antes eran inabordables. También se utiliza en mezclas de gaussianas, modelos bayesianos jerárquicos y sistemas de recomendación, entre otros.
+
+En resumen, SVI no cambia qué se optimiza, sino cómo se optimiza, y su valor reside en que hace viables modelos probabilísticos complejos sobre conjuntos de datos que los métodos tradicionales no pueden manejar.
+
+# Black Box Variational Inference (BBVI)
+
+Hasta ahora, la inferencia variacional ha resultado especialmente eficiente cuando el modelo tiene una estructura conveniente (familia exponencial, conjugación), que permite derivar actualizaciones cerradas como en CAVI o usar gradientes naturales en SVI.
+
+En muchos modelos reales estas condiciones no se cumplen. Entonces el problema deja de ser solo computacional y pasa a ser analítico: derivar las ecuaciones variacionales puede ser extremadamente laborioso o directamente inabordable, y la VI clásica deja de ser práctica porque exige cálculos específicos para cada modelo.
+
+*Black Box Variational Inference* (Ranganath et al., 2014) elimina estas derivaciones y convierte la inferencia variacional en un procedimiento genérico. Recordemos que se busca maximizar
+
+$$\mathcal{L}(\lambda) = \mathbb{E}_{q(z \mid \lambda)} \big[ \log p(x, z) - \log q(z \mid \lambda) \big].$$
+
+En modelos no conjugados:
+
+- las esperanzas no pueden calcularse de forma cerrada;
+- no existen actualizaciones del tipo CAVI;
+- derivar el gradiente requiere cálculos específicos del modelo.
+
+La idea fundamental es no calcular el ELBO exactamente, sino **estimar su gradiente por Monte Carlo**, lo que permite aplicar optimización estocástica con independencia de la estructura del modelo. Usando la identidad $\nabla_\lambda q = q \, \nabla_\lambda \log q$ se demuestra que
+
+$$\nabla_\lambda \mathcal{L}(\lambda) = \mathbb{E}_{q(z \mid \lambda)} \Big[ \nabla_\lambda \log q(z \mid \lambda) \big( \log p(x, z) - \log q(z \mid \lambda) \big) \Big],$$
+
+donde $\nabla_\lambda \log q(z \mid \lambda)$ es la función *score*. Con muestras independientes $z^{(s)} \sim q(z \mid \lambda)$, $s = 1, \ldots, S$, se obtiene el estimador
+
+$$\widehat{\nabla_\lambda \mathcal{L}} = \frac{1}{S} \sum_{s=1}^S \nabla_\lambda \log q(z^{(s)} \mid \lambda) \big( \log p(x, z^{(s)}) - \log q(z^{(s)} \mid \lambda) \big).$$
+
+El estimador solo requiere evaluar $\log p(x, z)$ y la función *score* de $q$, sin conocer nada más del modelo. Es insesgado, requisito imprescindible para aplicar optimización estocástica como en SVI, pero tiene una **varianza elevada**. El procedimiento general es:
+
+1. muestrear $z^{(s)} \sim q(z \mid \lambda)$, $s = 1, \ldots, S$;
+2. calcular el estimador del gradiente;
+3. actualizar los parámetros con un tamaño de paso $\rho_t$:
+$$\lambda \leftarrow \lambda + \rho_t \, \widehat{\nabla_\lambda \mathcal{L}}.$$
+
+Una varianza alta implica convergencia lenta e inestabilidad durante la optimización. Para mitigarla se emplean varias técnicas.
+
+**Variables de control (*baseline*).** Se resta una constante $b$ al término entre paréntesis:
+
+$$\nabla_\lambda \mathcal{L}(\lambda) = \mathbb{E}_{q(z \mid \lambda)} \Big[ \nabla_\lambda \log q(z \mid \lambda) \big( \log p(x, z) - \log q(z \mid \lambda) - b \big) \Big].$$
+
+Como $\mathbb{E}_q[\nabla_\lambda \log q(z \mid \lambda)] = 0$, la esperanza no cambia, pero una $b$ bien elegida reduce significativamente la varianza.
+
+**Rao-Blackwellización.** Aprovecha la factorización de $q(z)$ para integrar analíticamente parte de las variables y muestrear solo las necesarias, al estilo del muestreo de Gibbs colapsado. Es muy eficaz en modelos con estructura.
+
+BBVI es la base de desarrollos posteriores como la *Automatic Differentiation Variational Inference* (Kucukelbir et al., 2017), el truco de reparametrización —que ofrece estimadores del gradiente de varianza mucho menor cuando el modelo es diferenciable— y la inferencia variacional amortizada de los autoencoders variacionales (Kingma y Welling, 2014). En conclusión, BBVI extiende la inferencia variacional a prácticamente cualquier modelo a costa de introducir ruido en la estimación del gradiente.
+
+# Caso práctico: modelado de tópicos con LDA {#sec:lda}
+
+Esta sección aplica la inferencia variacional a la identificación de temas en una colección de textos mediante *Latent Dirichlet Allocation* (Blei et al., 2003).
+
+## Marco teórico
+
+El objetivo de LDA es descubrir estructura latente en colecciones de documentos. Partimos de:
+
+- un corpus $D = \{w_1, \ldots, w_M\}$ de $M$ documentos;
+- cada documento $w_d$ es una secuencia de palabras.
+
+Y queremos:
+
+- encontrar los temas ocultos del corpus;
+- representar cada documento como una combinación de esos temas.
+
+Los modelos previos presentan limitaciones importantes. El modelo *unigram* asume que todas las palabras de todos los documentos se generan de forma independiente a partir de una única distribución multinomial, $p(w) = \prod_{n=1}^{N} p(w_n)$, por lo que no puede capturar temas latentes. La mezcla de *unigrams* introduce una variable latente discreta que asigna un único tema a cada documento, hipótesis demasiado restrictiva, ya que los documentos suelen tratar varios temas a la vez.
+
+El modelo *probabilistic Latent Semantic Indexing* (pLSI) relaja esta restricción y permite que cada documento mezcle varios temas. No obstante, tiene dos inconvenientes: su número de parámetros crece linealmente con el número de documentos, lo que favorece el sobreajuste, y no define un modelo generativo completo, por lo que no se aplica de forma natural a documentos nuevos.
+
+LDA resuelve ambas limitaciones mediante un modelo generativo bayesiano completo, cuyo número de parámetros no depende del tamaño del corpus y que generaliza de forma natural a documentos no vistos.
+
+La idea fundamental de LDA es que cada documento es una mezcla de tópicos latentes, y cada tópico es una distribución sobre el vocabulario. El proceso generativo para un documento es:
+
+1. Elegir la longitud $N \sim \text{Poisson}(\xi)$ (hipótesis no esencial).
+2. Elegir las proporciones de tópicos $\theta \sim \text{Dir}(\alpha)$, un punto del símplice de dimensión $K - 1$.
+3. Para cada palabra $n \in \{1, \ldots, N\}$:
+    a. elegir un tópico $z_n \sim \text{Multinomial}(\theta)$;
+    b. elegir la palabra $w_n \sim p(w_n \mid z_n, \beta)$, una multinomial condicionada al tópico.
+
+En este modelo, $\theta$ representa la mezcla de tópicos del documento, $z_n$ el tópico asignado a la palabra $n$, la matriz $\beta \in \mathbb{R}^{K \times V}$ las distribuciones de palabras de cada tópico y $\alpha$ el hiperparámetro del prior sobre las proporciones. La distribución conjunta es
+
+$$p(\theta, z, w \mid \alpha, \beta) = p(\theta \mid \alpha) \prod_{n=1}^{N} p(z_n \mid \theta)\, p(w_n \mid z_n, \beta).$$
+
+LDA es un modelo bayesiano jerárquico de tres niveles: los parámetros del corpus, $\alpha$ y $\beta$; las variables de cada documento, $\theta_d$; y las variables de cada palabra, $z_{dn}$ y $w_{dn}$. Encaja exactamente en el esquema local-global de la sección anterior.
+
+Una hipótesis clave es la intercambiabilidad de las palabras dentro de cada documento (supuesto *bag-of-words*): el orden de las palabras no aporta información. Por el teorema de De Finetti, una secuencia intercambiable puede expresarse como una mezcla de variables i.i.d. condicionadas a una variable latente, que en LDA es $\theta$:
+
+$$p(w, z) = \int p(\theta) \prod_{n=1}^{N} p(z_n \mid \theta)\, p(w_n \mid z_n)\, d\theta.$$
+
+Marginalizando $z$, cada palabra sigue una mezcla de multinomiales:
+
+$$p(w_n \mid \theta, \beta) = \sum_{z_n} p(w_n \mid z_n, \beta)\, p(z_n \mid \theta).$$
+
+La posterior $p(\theta, z \mid w, \alpha, \beta)$ es intratable por el acoplamiento entre $\theta$ y $\beta$ en la evidencia, por lo que Blei et al. (2003) proponen una aproximación de campo medio $q(\theta, z \mid \gamma, \phi) = q(\theta \mid \gamma) \prod_n q(z_n \mid \phi_n)$, con $q(\theta \mid \gamma)$ Dirichlet y $q(z_n \mid \phi_n)$ multinomial. Los parámetros $\alpha$ y $\beta$ se estiman por máxima verosimilitud mediante un algoritmo **EM variacional (VEM)**: el paso E ejecuta CAVI sobre $(\gamma, \phi)$ para cada documento y el paso M maximiza el ELBO resultante respecto a $(\alpha, \beta)$. Es el método implementado en el paquete `topicmodels` (Grün y Hornik, 2011).
+
+En la práctica, LDA transforma cada documento en un vector de proporciones de tópicos $\gamma_d$ y cada tópico en una distribución sobre palabras $\beta_k$: representaciones de baja dimensión, interpretables y útiles para clasificación, *clustering* o recuperación de información.
+
+El modelo requiere representar el corpus como una matriz documento-término $X \in \mathbb{N}^{M \times V}$, donde $V$ es el tamaño del vocabulario y $X_{dv}$ la frecuencia de la palabra $v$ en el documento $d$. El preprocesado es crítico: tokenización, normalización (minúsculas, eliminación de puntuación y números), eliminación de *stopwords*, lematización y filtrado de términos demasiado raros o demasiado frecuentes.
+
+Por último, conviene recordar los supuestos del modelo: se pierde el orden de las palabras, se asume independencia condicional entre palabras dado el tópico y el número de tópicos $K$ se fija a priori como hiperparámetro.
+
+## Datos
+
+El corpus está formado por fragmentos de obras clásicas de dominio público obtenidas de [Project Gutenberg](https://www.gutenberg.org/), agrupadas en cuatro categorías temáticas: historia antigua, ciencias naturales, economía política y filosofía moral. Cada fila de `data/train.csv` y `data/test.csv` contiene un identificador, la categoría, la obra de origen y el texto.
+
+Un detalle importante es que **las obras de entrenamiento y test son distintas** (por ejemplo, *La riqueza de las naciones* está en entrenamiento y *El contrato social* en test). Así, la evaluación mide si los tópicos aprendidos generalizan a autores y estilos no vistos, y no solo a fragmentos nuevos de los mismos libros. La categoría no se utiliza para ajustar el modelo, que es no supervisado; se reserva únicamente para evaluar a posteriori la coherencia de los tópicos.
+
+## Implementación en R
+
+Cargamos los paquetes necesarios. `tidytext` proporciona las herramientas para manipular texto en formato *tidy*; `topicmodels` implementa LDA mediante EM variacional; `textstem` realiza la lematización; y `ggplot2` y `tidyr` se usan para visualización y transformación de datos.
+
+```{r paquetes}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(tidytext)
+library(textstem)
+library(topicmodels)
+```
+
+### Carga de datos
+
+Cargamos los conjuntos de entrenamiento y test por separado y los mantenemos así durante todo el análisis. El vocabulario se construye solo con el entrenamiento para evitar fuga de información (*data leakage*): el modelo nunca ve los documentos de test durante el ajuste.
+
+```{r carga}
+leer_corpus <- function(ruta) {
+  read.csv(ruta, header = TRUE, stringsAsFactors = FALSE) %>%
+    select(id, categoria = topic, obra = book, texto = text)
+}
+
+df_train <- leer_corpus("data/train.csv")
+df_test  <- leer_corpus("data/test.csv")
+
+bind_rows(train = df_train, test = df_test, .id = "conjunto") %>%
+  count(conjunto, categoria) %>%
+  pivot_wider(names_from = conjunto, values_from = n) %>%
+  knitr::kable(booktabs = TRUE, caption = "Documentos por categoría y conjunto.")
+```
+
+### Preprocesado
+
+Usamos la lista de *stopwords* de `tidytext` (más de 1 000 palabras en inglés procedentes de varios léxicos) y le añadimos un conjunto de términos muy frecuentes en textos clásicos y en el estilo narrativo que no aportan contenido temático.
+
+```{r stopwords}
+data("stop_words")
+
+extra_stopwords <- tibble(
+  word = c("upon", "shall", "hath", "thee", "thou", "thy",
+           "said", "one", "now", "may", "yet", "must",
+           "great", "man", "men", "time", "things", "made",
+           "every", "like", "much", "well", "also", "without",
+           "among", "therefore", "thus", "hence", "whose"),
+  lexicon = "custom_literature"
+)
+
+mis_stopwords <- bind_rows(stop_words, extra_stopwords)
+```
+
+La siguiente función tokeniza, elimina números, palabras de dos caracteres o menos y *stopwords*, y lematiza. El filtro de *stopwords* se aplica también después de lematizar, ya que la lematización puede convertir una palabra válida en una *stopword*. Devuelve una tabla con tripletas `(id, word, n)`: el número de veces que cada término aparece en cada documento.
+
+```{r preprocesado}
+preprocesar <- function(df, sw = mis_stopwords) {
+  df %>%
+    unnest_tokens(word, texto) %>%
+    filter(!str_detect(word, "^\\d+$"),
+           nchar(word) > 2) %>%
+    anti_join(sw, by = "word") %>%
+    mutate(word = lemmatize_words(word)) %>%
+    anti_join(sw, by = "word") %>%        # la lematización puede generar stopwords
+    count(id, word, sort = TRUE)
+}
+
+counts_train <- preprocesar(df_train)
+counts_test  <- preprocesar(df_test)
+```
+
+A continuación filtramos el vocabulario por frecuencia documental. Eliminamos los términos que aparecen en 5 documentos o menos, que no aportan información estadística suficiente, y los que aparecen en el 20 % o más de los documentos, que al ser ubicuos no discriminan entre tópicos. El vocabulario se calcula únicamente con el conjunto de entrenamiento y después se aplica al de test.
+
+```{r vocabulario}
+n_docs_train <- nrow(df_train)
+
+vocab <- counts_train %>%
+  group_by(word) %>%
+  summarise(n_docs = n_distinct(id), .groups = "drop") %>%
+  filter(n_docs > 5, n_docs < 0.2 * n_docs_train) %>%
+  pull(word)
+
+cat("Tamaño del vocabulario (train):", length(vocab), "términos\n")
+```
+
+Convertimos las tablas de conteos a matrices documento-término (DTM), el formato de entrada de `topicmodels::LDA`, usando el mismo vocabulario en ambos conjuntos.
+
+```{r dtm}
+dtm_train <- counts_train %>%
+  filter(word %in% vocab) %>%
+  cast_dtm(id, word, n)
+
+dtm_test <- counts_test %>%
+  filter(word %in% vocab) %>%
+  cast_dtm(id, word, n)
+
+dtm_train
+dtm_test
+```
+
+### Selección del número de tópicos
+
+Para elegir $K$ ajustamos un modelo LDA por EM variacional para cada valor candidato y evaluamos la perplejidad sobre entrenamiento y test. La perplejidad es la exponencial de la entropía cruzada media por palabra; valores más bajos indican mejor capacidad predictiva:
+
+$$\mathrm{Perplejidad}(D) = \exp\left( - \frac{\sum_{d \in D} \log p(w_d)}{\sum_{d \in D} N_d} \right).$$
+
+Una perplejidad de valor $X$ se interpreta como que el modelo duda, en promedio, entre $X$ palabras equiprobables al predecir cada término. Su valor mínimo teórico es 1. En `topicmodels`, $\log p(w_d)$ se sustituye por su cota inferior variacional, por lo que la perplejidad obtenida es una cota superior de la real.
+
+Nos interesa especialmente la curva de test: una perplejidad de entrenamiento mucho menor que la de test indicaría sobreajuste. Un buen $K$ suele encontrarse en el codo de la curva de test, a partir del cual aumentar $K$ apenas mejora el modelo.
+
+El hiperparámetro $\alpha$ del prior de Dirichlet es determinante. Un $\alpha$ pequeño favorece documentos dominados por pocos tópicos, mientras que uno grande reparte la masa de forma homogénea y dificulta la separación de tópicos. Usamos $\alpha = 0.01$ como valor inicial, que `topicmodels` reestima después en cada paso M. Definimos una única configuración de control para que la búsqueda de $K$ y el modelo final sean coherentes.
+
+```{r control}
+control_lda <- list(
+  seed           = 1234,
+  alpha          = 0.01,   # valor inicial; se reestima (estimate.alpha = TRUE)
+  estimate.alpha = TRUE,
+  estimate.beta  = TRUE
+)
+```
+
+```{r seleccion-k, fig.cap="Perplejidad en entrenamiento y test en función del número de tópicos."}
+k_grid <- 2:20
+
+evaluar_k <- function(k) {
+  modelo <- LDA(dtm_train, k = k, method = "VEM", control = control_lda)
+  tibble(
+    k                = k,
+    perplexity_train = perplexity(modelo, dtm_train),
+    perplexity_test  = perplexity(modelo, newdata = dtm_test)
+  )
+}
+
+# Ajustar 19 modelos lleva tiempo: se paraleliza y el resultado se guarda en
+# results/. Borrar el fichero fuerza a recalcularlo.
+ruta_metricas <- "results/metricas_k.csv"
+
+if (file.exists(ruta_metricas)) {
+  metricas_k <- read.csv(ruta_metricas)
+} else {
+  library(parallel)
+  cl <- makeCluster(min(length(k_grid), detectCores() - 1))
+  clusterEvalQ(cl, { library(topicmodels); library(tibble) })
+  clusterExport(cl, c("dtm_train", "dtm_test", "control_lda"))
+  metricas_k <- bind_rows(parLapply(cl, k_grid, evaluar_k))
+  stopCluster(cl)
+  dir.create("results", showWarnings = FALSE)
+  write.csv(metricas_k, ruta_metricas, row.names = FALSE)
+}
+
+p_perplejidad <- metricas_k %>%
+  pivot_longer(c(perplexity_train, perplexity_test),
+               names_to = "conjunto", values_to = "perplejidad") %>%
+  mutate(conjunto = recode(conjunto,
+                           perplexity_train = "Entrenamiento",
+                           perplexity_test  = "Test")) %>%
+  ggplot(aes(k, perplejidad, colour = conjunto)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = k_grid) +
+  scale_colour_manual(values = c(Entrenamiento = "#2563EB", Test = "#DB2777")) +
+  labs(title  = "Perplejidad según el número de tópicos",
+       x      = "Número de tópicos (K)",
+       y      = "Perplejidad",
+       colour = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+ggsave("figures/lda-perplejidad.png", p_perplejidad,
+       width = 8, height = 5, dpi = 150, bg = "white")
+p_perplejidad
+```
+
+```{r tabla-k}
+metricas_k %>%
+  mutate(across(starts_with("perplexity"), ~ round(.x, 1))) %>%
+  rename(K = k, `Perplejidad (train)` = perplexity_train,
+         `Perplejidad (test)` = perplexity_test) %>%
+  knitr::kable(booktabs = TRUE, caption = "Perplejidad para cada valor de K.")
+```
+
+La perplejidad de entrenamiento decrece de forma monótona con $K$, como cabe esperar de un modelo con más parámetros. La de test, en cambio, desciende con claridad hasta $K \approx 6$ y a partir de ahí entra en una meseta en la que las diferencias entre valores de $K$ son inferiores al 3 %: añadir tópicos apenas mejora la capacidad predictiva fuera de muestra y sí aumenta la brecha con entrenamiento. Elegimos $K = 7$, dentro de esa meseta, porque con un tópico adicional el modelo separa las dos grandes líneas de la obra de Darwin (variación de especies y selección sexual), lo que mejora la interpretabilidad sin coste predictivo.
+
+```{r k-optimo}
+k_optimo <- 7
+```
+
+### Ajuste del modelo final
+
+Ajustamos el modelo definitivo con el $K$ elegido y la misma configuración (y semilla) que en la búsqueda.
+
+```{r modelo-final}
+ruta_modelo <- sprintf("results/lda_k%d.rds", k_optimo)
+
+if (file.exists(ruta_modelo)) {
+  lda_final <- readRDS(ruta_modelo)
+} else {
+  lda_final <- LDA(dtm_train, k = k_optimo, method = "VEM", control = control_lda)
+  dir.create("results", showWarnings = FALSE)
+  saveRDS(lda_final, ruta_modelo)
+}
+
+tibble(
+  Métrica = c("Perplejidad (train)", "Perplejidad (test)", "alpha estimado"),
+  Valor   = c(perplexity(lda_final, dtm_train),
+              perplexity(lda_final, newdata = dtm_test),
+              lda_final@alpha)
+) %>%
+  mutate(Valor = round(Valor, 3)) %>%
+  knitr::kable(booktabs = TRUE, align = "lr",
+               caption = "Métricas del modelo final.")
+```
+
+### Interpretación de los tópicos
+
+La matriz $\beta$ recoge la probabilidad de cada palabra dentro de cada tópico. Las palabras con mayor $\beta$ son las que permiten interpretar el tópico. Esta visualización es la principal herramienta de interpretación y también orienta sobre si conviene aumentar $K$ (tópicos que mezclan campos semánticos distintos) o reducirlo (tópicos redundantes).
+
+```{r top-terminos, fig.height=8, out.width="100%", fig.cap="Doce términos con mayor probabilidad en cada tópico."}
+top_terms <- tidy(lda_final, matrix = "beta") %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 12, with_ties = FALSE) %>%
+  ungroup()
+
+p_terminos <- top_terms %>%
+  mutate(term = reorder_within(term, beta, topic),
+         topic = paste("Tópico", topic)) %>%
+  ggplot(aes(beta, term, fill = topic)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y", ncol = 3) +
+  scale_y_reordered() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = paste0("Términos más probables por tópico (K = ", k_optimo, ")"),
+       x = expression(beta), y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave("figures/lda-top-terminos.png", p_terminos,
+       width = 9, height = 8, dpi = 150, bg = "white")
+p_terminos
+```
+
+A partir de los términos más probables (y de las obras que dominan cada tópico), la interpretación es la siguiente:
+
+| Tópico | Términos principales                                   | Interpretación                 | Obras dominantes                      |
+|:------:|:-------------------------------------------------------|:-------------------------------|:--------------------------------------|
+| 1 | city, war, king, army, athenians, enemy, soldier | Historia militar | Plutarco, Tucídides, Heródoto |
+| 2 | pleasure, virtue, moral, principle, friendship, pain | Ética | Aristóteles, Paine |
+| 3 | trade, colony, sea, nation, river, europe, company | Comercio y geografía | Smith, *Viaje del Beagle* |
+| 4 | species, animal, plant, variety, island, genus | Variación de especies | *El origen de las especies*, *Beagle* |
+| 5 | male, female, colour, sex, bird, sexual, selection | Selección sexual | *El origen del hombre* |
+| 6 | price, labour, tax, profit, capital, money (+ earth, fire, air) | Economía (mezclado con física) | Smith, Lucrecio |
+| 7 | god, doth, soveraign, thyself, church, christ, scripture | Teología y registro arcaico | Hobbes, Marco Aurelio |
+
+Cinco de los siete tópicos son semánticamente limpios. Los otros dos ilustran limitaciones típicas de LDA:
+
+- **Tópico 6.** Con un número reducido de tópicos, el modelo fusiona dos bloques de vocabulario muy concentrados: la economía de Smith y la física de Lucrecio (*earth*, *fire*, *air* aparecen entre sus 25 términos principales).
+- **Tópico 7.** Agrupa *Leviatán* y las *Meditaciones* no tanto por su contenido como por el **registro lingüístico** de sus traducciones: formas arcaicas como *doth*, *thyself*, *onely* o *soveraign*. LDA modela coocurrencias, no significado, y un estilo compartido genera coocurrencias tan fuertes como un tema compartido. Ampliar la lista de *stopwords* con estas formas, o normalizar la ortografía, es una mejora natural del preprocesado.
+
+### Proporciones de tópicos por documento
+
+La matriz $\gamma$ recoge la mezcla de tópicos de cada documento. Un documento rara vez pertenece a un único tópico; la Figura \ref{fig:gamma} muestra cómo se distribuye el peso de cada tópico en el corpus de entrenamiento.
+
+```{r gamma, fig.height=5, fig.cap="Distribución de las proporciones de tópico $\\gamma$ en entrenamiento. Valores próximos a 1 corresponden a documentos dominados por un solo tópico."}
+gamma_train <- tidy(lda_final, matrix = "gamma")
+
+gamma_train %>%
+  mutate(topic = paste("Tópico", topic)) %>%
+  ggplot(aes(gamma, fill = topic)) +
+  geom_histogram(bins = 20, show.legend = FALSE) +
+  facet_wrap(~ topic, ncol = 4) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = "gamma (peso del tópico en el documento)",
+       y = "Número de documentos") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank())
+```
+
+Para asignar a cada documento un único tópico tomamos el de mayor $\gamma$. En los documentos de test usamos `posterior()`, que proyecta los documentos nuevos sobre los tópicos aprendidos sin reajustar $\beta$, igual que ocurriría con el modelo en producción.
+
+```{r asignacion}
+topico_dominante <- function(gamma_df) {
+  gamma_df %>%
+    group_by(document) %>%
+    slice_max(gamma, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(id = document, topico = topic, gamma_max = gamma)
+}
+
+doc_topics_train <- topico_dominante(gamma_train)
+
+post_test  <- posterior(lda_final, newdata = dtm_test)
+gamma_test <- as.data.frame(post_test$topics) %>%
+  rownames_to_column("document") %>%
+  pivot_longer(-document, names_to = "topic", values_to = "gamma") %>%
+  mutate(topic = as.integer(topic))
+
+doc_topics_test <- topico_dominante(gamma_test)
+```
+
+### Evaluación frente a las categorías reales
+
+Aunque LDA es no supervisado, las categorías del corpus permiten comprobar si los tópicos descubiertos se corresponden con la estructura temática real. La Figura \ref{fig:cruce} cruza el tópico dominante de cada documento con su categoría.
+
+```{r cruce, fig.height=4.5, fig.cap="Proporción de documentos de cada categoría asignados a cada tópico dominante, en entrenamiento y en test (obras no vistas)."}
+cruce <- bind_rows(
+  Entrenamiento = doc_topics_train %>% inner_join(df_train, by = "id"),
+  Test          = doc_topics_test  %>% inner_join(df_test,  by = "id"),
+  .id = "conjunto"
+) %>%
+  count(conjunto, categoria, topico) %>%
+  group_by(conjunto, categoria) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  complete(conjunto, categoria, topico, fill = list(n = 0, prop = 0))
+
+p_cruce <- cruce %>%
+  ggplot(aes(factor(topico), categoria, fill = prop)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = ifelse(n > 0, n, "")), size = 3.2,
+            colour = ifelse(cruce$prop > 0.5, "white", "grey20")) +
+  facet_wrap(~ conjunto) +
+  scale_fill_gradient(low = "#F1F5F9", high = "#1E3A8A",
+                      labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Tópico dominante", y = NULL, fill = "% de la categoría") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+
+ggsave("figures/lda-topicos-vs-categorias.png", p_cruce,
+       width = 9, height = 4.5, dpi = 150, bg = "white")
+p_cruce
+```
+
+Para resumir la correspondencia en una cifra, asignamos a cada tópico la categoría mayoritaria entre sus documentos de **entrenamiento** y medimos la pureza (proporción de documentos cuya categoría coincide con la asignada a su tópico) en ambos conjuntos, junto con la información mutua normalizada (NMI) entre tópicos y categorías.
+
+```{r pureza}
+mapa_topico <- doc_topics_train %>%
+  inner_join(df_train, by = "id") %>%
+  count(topico, categoria) %>%
+  group_by(topico) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(topico, categoria_asignada = categoria)
+
+nmi <- function(a, b) {
+  tab <- table(a, b) / length(a)
+  pa  <- rowSums(tab)
+  pb  <- colSums(tab)
+  nz  <- tab > 0
+  mi  <- sum(tab[nz] * log(tab[nz] / outer(pa, pb)[nz]))
+  h   <- function(p) -sum(p[p > 0] * log(p[p > 0]))
+  mi / sqrt(h(pa) * h(pb))
+}
+
+evaluar <- function(doc_topics, df) {
+  d <- doc_topics %>%
+    inner_join(df, by = "id") %>%
+    left_join(mapa_topico, by = "topico")
+  tibble(Documentos = nrow(d),
+         Pureza     = mean(d$categoria == d$categoria_asignada, na.rm = TRUE),
+         NMI        = nmi(d$topico, d$categoria))
+}
+
+metricas_eval <- bind_rows(
+  Entrenamiento = evaluar(doc_topics_train, df_train),
+  Test          = evaluar(doc_topics_test,  df_test),
+  .id = "Conjunto"
+)
+
+metricas_eval %>%
+  mutate(across(c(Pureza, NMI), ~ round(.x, 3))) %>%
+  knitr::kable(booktabs = TRUE,
+               caption = "Correspondencia entre tópicos y categorías reales.")
+```
+
+En entrenamiento la correspondencia es alta (pureza del 78 %): la mayoría de tópicos están dominados por una única categoría, y las mezclas se concentran en los tópicos 6 y 7 descritos antes. En test, con obras que el modelo no ha visto, la pureza cae al 57 % y la NMI de 0.58 a 0.44. El desglose por obra explica la caída:
+
+- **Historia antigua** generaliza perfectamente: los 45 fragmentos de Jenofonte y César se asignan al tópico militar.
+- **Ciencias naturales** generaliza bien: *La expresión de las emociones* cae en los tópicos darwinianos 4 y 5, y *El poder del movimiento en las plantas* en el tópico 3, que el entrenamiento asocia sobre todo a esta categoría.
+- **Economía política** se desplaza hacia el tópico de ética (22 de 32 fragmentos de Rousseau): *El contrato social* es filosofía política y no economía, y comparte más vocabulario con Aristóteles que con Adam Smith.
+- **Filosofía** es el caso más difícil: los *Discursos* de Epicteto, escritos en forma de diálogo con abundantes referencias a personajes, se asignan al tópico de historia.
+
+La conclusión es que los tópicos de LDA capturan fielmente la estructura léxica del corpus, pero las categorías del conjunto de datos son heterogéneas: bajo *stoic_philosophy* conviven un estoico (Marco Aurelio), un peripatético (Aristóteles) y un epicúreo (Lucrecio), y bajo *political_economy* conviven la economía de Smith y la teoría política de Rousseau o Locke. Con solo tres obras por categoría en entrenamiento, los tópicos tienden a especializarse en autores concretos, y la generalización a autores nuevos depende de cuánto vocabulario compartan con ellos.
+
+# Conclusiones
+
+La inferencia variacional convierte la inferencia bayesiana en un problema de optimización del ELBO. Su principal virtud es la escalabilidad: las actualizaciones en forma cerrada de CAVI en modelos conjugados, el gradiente natural estocástico de SVI y los estimadores Monte Carlo de BBVI la hacen aplicable desde modelos conjugados clásicos hasta modelos profundos no conjugados. Su principal limitación es el sesgo inherente a minimizar $\mathrm{KL}(q \,\|\, p)$ sobre una familia restringida, que se manifiesta en particular como subestimación de la incertidumbre.
+
+El caso práctico muestra el método en funcionamiento. El EM variacional de LDA ajusta un corpus de 1 620 documentos y casi 6 000 términos, y descubre sin supervisión tópicos interpretables que se corresponden en gran medida con las categorías reales. La evaluación sobre obras no vistas pone de manifiesto también sus límites: los tópicos reflejan coocurrencias léxicas, incluidas las de estilo, y la perplejidad por sí sola no basta para elegir $K$ ni garantiza tópicos semánticamente puros.
+
+Algunas extensiones naturales de este trabajo son:
+
+- Normalizar la ortografía arcaica y ampliar las *stopwords* para eliminar los tópicos de estilo.
+- Seleccionar $K$ combinando la perplejidad con métricas de coherencia semántica.
+- Ajustar el mismo modelo con SVI (LDA *online*) y comparar tiempo y calidad frente al EM variacional por lotes.
+- Contrastar las proporciones de tópicos obtenidas con las de un muestreador de Gibbs colapsado, para cuantificar empíricamente el sesgo de la aproximación de campo medio.
+
+# Referencias
+
+Amari, S. (1998). Natural gradient works efficiently in learning. *Neural Computation*, 10(2), 251–276.
+
+Arjovsky, M., Chintala, S. y Bottou, L. (2017). Wasserstein generative adversarial networks. *Proceedings of the 34th International Conference on Machine Learning (ICML)*.
+
+Blei, D. M., Kucukelbir, A. y McAuliffe, J. D. (2017). Variational inference: A review for statisticians. *Journal of the American Statistical Association*, 112(518), 859–877.
+
+Blei, D. M., Ng, A. Y. y Jordan, M. I. (2003). Latent Dirichlet allocation. *Journal of Machine Learning Research*, 3, 993–1022.
+
+Grün, B. y Hornik, K. (2011). topicmodels: An R package for fitting topic models. *Journal of Statistical Software*, 40(13), 1–30.
+
+Hoffman, M. D., Blei, D. M., Wang, C. y Paisley, J. (2013). Stochastic variational inference. *Journal of Machine Learning Research*, 14, 1303–1347.
+
+Kingma, D. P. y Welling, M. (2014). Auto-encoding variational Bayes. *International Conference on Learning Representations (ICLR)*.
+
+Kucukelbir, A., Tran, D., Ranganath, R., Gelman, A. y Blei, D. M. (2017). Automatic differentiation variational inference. *Journal of Machine Learning Research*, 18(14), 1–45.
+
+Li, Y. y Turner, R. E. (2016). Rényi divergence variational inference. *Advances in Neural Information Processing Systems (NeurIPS)*, 29.
+
+Ranganath, R., Gerrish, S. y Blei, D. M. (2014). Black box variational inference. *Proceedings of the 17th International Conference on Artificial Intelligence and Statistics (AISTATS)*, 814–822.
+
+Robbins, H. y Monro, S. (1951). A stochastic approximation method. *The Annals of Mathematical Statistics*, 22(3), 400–407.
+
+Silge, J. y Robinson, D. (2016). tidytext: Text mining and analysis using tidy data principles in R. *Journal of Open Source Software*, 1(3), 37.
+
+Tolstikhin, I., Bousquet, O., Gelly, S. y Schölkopf, B. (2018). Wasserstein auto-encoders. *International Conference on Learning Representations (ICLR)*.

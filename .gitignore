@@ -1,0 +1,23 @@
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Artefactos de knitr / LaTeX
+*_cache/
+*_files/
+*.log
+*.tex
+*.aux
+*.out
+*.toc
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Material local no versionado
+_original/
+Rplots.pdf
