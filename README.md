@@ -119,10 +119,9 @@ El renderizado utiliza los resultados guardados en `results/` y tarda menos de u
 
 La bibliografía completa está al final del documento.
 
-## Autores
+## Autor
 
-- **Nolhan Denis Alonso Guignon**: [@NolhanAlonsoGuignon](https://github.com/NolhanAlonsoGuignon)
-- **Ismael Amador García**
+**Nolhan Denis Alonso Guignon**: [@NolhanAlonsoGuignon](https://github.com/NolhanAlonsoGuignon)
 
 ## Licencia
 

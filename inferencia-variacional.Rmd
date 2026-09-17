@@ -1,9 +1,7 @@
 ---
 title: "Inferencia Variacional"
 subtitle: "Fundamentos, CAVI, SVI y BBVI, con una aplicación a modelado de tópicos mediante LDA"
-author:
-  - Nolhan Denis Alonso Guignon
-  - Ismael Amador García
+author: "Nolhan Denis Alonso Guignon"
 date: "2026"
 abstract: |
   La inferencia variacional (VI) reformula el cálculo de la distribución a posteriori como un problema de optimización: en lugar de muestrear de $p(z \mid x)$, se busca la distribución más próxima a ella dentro de una familia tratable. Este documento desarrolla el marco teórico completo —divergencia de Kullback-Leibler, ELBO, familia de campo medio y el algoritmo CAVI—, su especialización a modelos conjugados de la familia exponencial y las dos extensiones que la han hecho práctica a gran escala: la inferencia variacional estocástica (SVI) y la inferencia variacional de caja negra (BBVI). Como aplicación, se ajusta un modelo *Latent Dirichlet Allocation* por EM variacional sobre un corpus de 1 800 fragmentos de obras clásicas, se selecciona el número de tópicos mediante perplejidad fuera de muestra y se evalúa la coherencia de los tópicos descubiertos frente a las categorías reales de los textos.
